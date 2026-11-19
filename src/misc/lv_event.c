@@ -105,12 +105,6 @@ lv_result_t lv_event_send(lv_event_list_t * list, lv_event_t * e, bool preproces
     LV_CHECK_ARG(e != NULL, return LV_RESULT_INVALID);
     if(e->deleted) return LV_RESULT_INVALID;
 
-    /* When obj is deleted in its own event, it will cause the `list->array` header to be released,
-     * but the content still exists, which leads to memory leakage.
-     * Therefore, back up the header in advance,
-     * which can strive to release the memory and prevent used-after-free. */
-    lv_array_t back_array_head = list->array;
-
     /* Dealing with the problem of nested event deletion event */
     const bool is_traversing = list->is_traversing;
     list->is_traversing = true;
@@ -118,7 +112,12 @@ lv_result_t lv_event_send(lv_event_list_t * list, lv_event_t * e, bool preproces
     lv_result_t res = LV_RESULT_OK;
     const uint32_t size = event_array_size(list);
     for(uint32_t i = 0; i < size && !e->deleted; i++) {
-        lv_event_dsc_t * dsc = *event_array_at(list, i);
+        lv_event_dsc_t ** slot = event_array_at(list, i);
+        if(slot == NULL) break;
+        lv_event_dsc_t * dsc = *slot;
+        /* A deletion that happened during traversal can leave a stale slot.
+         * Skip it rather than dereferencing a freed descriptor. */
+        if(dsc == NULL || dsc == (lv_event_dsc_t *)(void *)-1) continue;
         if(dsc->cb == NULL) continue;
         if(event_is_marked_deleting(dsc)) continue;
         const bool is_preprocessed = (dsc->filter & LV_EVENT_PREPROCESS) != 0;
@@ -142,11 +141,19 @@ lv_result_t lv_event_send(lv_event_list_t * list, lv_event_t * e, bool preproces
 
     if(is_traversing) return res;
 
-    if(e->deleted) cleanup_event_list_core(&back_array_head);
-    else {
-        list->is_traversing = false;
-        cleanup_event_list(list);
-    }
+    /* When a callback deletes an object, `lv_event_mark_deleted` sets
+     * `e->deleted` even when the object owning this list survives (for example
+     * when a *descendant* of the list owner is deleted while an event bubbles
+     * through an ancestor). Cleaning up through a backed-up header in that case
+     * frees/reallocates the array data while `list->array` still points at it,
+     * leaving a dangling pointer in a live object. Skip cleanup here: deletion
+     * marks stay in the array and are skipped during traversal, and the owning
+     * object's destructor calls `lv_event_remove_all` if it really is being
+     * deleted. The small leak is bounded by the callbacks of deleted objects. */
+    if(e->deleted) return res;
+
+    list->is_traversing = false;
+    cleanup_event_list(list);
 
     return res;
 }
